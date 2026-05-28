@@ -9,7 +9,7 @@
 - 情绪状态识别
 - 社交关系状态识别
 - 识别结果到反馈策略的映射
-- DeepSeek API 生成识别结果和回复
+- DeepSeek API 深度参与单轮规划：结合历史对话、信息槽、当前输入，同时生成识别结果、策略和自然回复
 - API 不可用时自动使用本地规则 fallback
 - SQLite 保存消息、识别结果、策略和会话摘要
 - Emotion Dashboard：展示当前会话指标、历史情绪统计、社交状态统计、强度趋势和历史记录
@@ -48,7 +48,8 @@ http://127.0.0.1:8501
 4. 登录后可以开始聊天。
 5. 点击“新会话”可以结束当前会话并开始新的演示。
 6. 右侧 Dashboard 会显示当前用户自己的情绪历史和分析结果。
-7. 勾选“使用 DeepSeek API”时，系统会调用 DeepSeek；取消勾选时，系统强制使用本地规则 fallback。
+7. 可以在右上角的 `DeepSeek API Key` 输入框临时粘贴 API key；它只随请求发送，不会保存到数据库。
+8. 勾选“使用 DeepSeek API”时，系统会让 DeepSeek 深度参与整轮对话规划；取消勾选时，系统强制使用本地规则 fallback。
 
 默认页面会填入：
 
@@ -93,7 +94,7 @@ I tried to fix the same bug for two hours. I feel stuck, and I do not know who I
 
 当前版本是课堂展示原型，不是最终产品。
 
-如果设置了 `DEEPSEEK_API_KEY`，系统会优先调用 DeepSeek。
+如果设置了 `DEEPSEEK_API_KEY`，系统会优先调用 DeepSeek。也可以直接在页面右上角临时输入 DeepSeek API Key。
 
 如果没有设置 API key，或者网络/API 调用失败，系统会使用本地规则进行识别和回复，保证演示不中断。
 

@@ -288,6 +288,9 @@ def means_no_available_support(text: str) -> bool:
             "没有人",
             "不知道问谁",
             "不知道可以问谁",
+            "不知道能找谁",
+            "不知道找谁",
+            "不知道向谁",
             "没有可以问的人",
             "没有可以讨论的人",
             "没人可以讨论",
@@ -322,10 +325,16 @@ def detect_emotion(text: str) -> tuple[str, float, int, str]:
     return "neutral", 0.72, 3, "neutral"
 
 
-def deepseek_chat(messages: list[dict], temperature: float = 0.2, max_tokens: int = 500, enabled: bool = True) -> str | None:
+def deepseek_chat(
+    messages: list[dict],
+    temperature: float = 0.2,
+    max_tokens: int = 500,
+    enabled: bool = True,
+    api_key_override: str | None = None,
+) -> str | None:
     if not enabled:
         return None
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    api_key = (api_key_override or os.getenv("DEEPSEEK_API_KEY", "")).strip()
     if not api_key:
         return None
     body = json.dumps(
@@ -372,6 +381,21 @@ def extract_json_object(text: str) -> dict | None:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             return None
+
+
+def recent_messages(session_id: str, limit: int = 10) -> list[dict]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT role, content, emotion, intensity, social_state, strategy, is_intervention, created_at
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (session_id, limit),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
 
 
 def update_dialogue_slots(session_id: str, text: str) -> dict:
@@ -461,7 +485,7 @@ def rule_analyse_state(session_id: str, text: str) -> dict:
     }
 
 
-def analyse_state(session_id: str, text: str, use_api: bool = True) -> dict:
+def analyse_state(session_id: str, text: str, use_api: bool = True, api_key: str | None = None) -> dict:
     slots = update_dialogue_slots(session_id, text)
     dialogue_context = {
         "recent_status": slots.get("recent_status"),
@@ -507,6 +531,7 @@ JSON schema:
         temperature=0.1,
         max_tokens=300,
         enabled=use_api,
+        api_key_override=api_key,
     )
     parsed = extract_json_object(raw) if raw else None
     if not parsed:
@@ -540,6 +565,141 @@ JSON schema:
         "valence": valence,
         "social_state": social_state,
         "missing_info": [str(item) for item in missing_info],
+    }
+
+
+def validate_state(parsed_state: dict, fallback: dict) -> dict:
+    emotion = str(parsed_state.get("emotion", fallback["emotion"]))
+    if emotion not in {"joy", "sadness", "anxiety", "anger", "frustration", "neutral", "surprise"}:
+        emotion = fallback["emotion"]
+    valence = str(parsed_state.get("valence", fallback["valence"]))
+    if valence not in {"positive", "neutral", "negative"}:
+        valence = fallback["valence"]
+    social_state = str(parsed_state.get("social_state", fallback["social_state"]))
+    if social_state not in {"supportive", "isolated", "conflictual", "unstable", "unknown"}:
+        social_state = fallback["social_state"]
+    try:
+        confidence = max(0.0, min(1.0, float(parsed_state.get("confidence", fallback["confidence"]))))
+    except (TypeError, ValueError):
+        confidence = fallback["confidence"]
+    try:
+        intensity = max(0, min(10, int(parsed_state.get("intensity", fallback["intensity"]))))
+    except (TypeError, ValueError):
+        intensity = fallback["intensity"]
+    missing_info = parsed_state.get("missing_info", fallback["missing_info"])
+    if not isinstance(missing_info, list):
+        missing_info = fallback["missing_info"]
+    return {
+        "emotion": emotion,
+        "confidence": confidence,
+        "intensity": intensity,
+        "valence": valence,
+        "social_state": social_state,
+        "missing_info": [str(item) for item in missing_info],
+    }
+
+
+def deepseek_plan_turn(session_id: str, text: str, style: str, api_key: str | None = None) -> dict | None:
+    slots = update_dialogue_slots(session_id, text)
+    slot_context = {
+        "recent_status": slots.get("recent_status"),
+        "pressure_source": slots.get("pressure_source"),
+        "sleep_energy": slots.get("sleep_energy"),
+        "key_people": slots.get("key_people"),
+        "support_level": slots.get("support_level"),
+        "conflict_signal": slots.get("conflict_signal"),
+        "missing_info": json.loads(slots.get("missing_info") or "[]"),
+    }
+    history = recent_messages(session_id, limit=12)
+    style_label = {
+        "empathetic": "共情、温和、先承接感受",
+        "rational": "理性、结构化、帮助拆解问题",
+        "light": "轻松、低压力、但不要轻浮",
+        "positive": "积极、鼓励、强化资源和进展",
+    }.get(style, "共情、温和、先承接感受")
+    prompt = f"""
+你现在不是简单分类器，而是一个“对话回合规划器”。请根据历史对话、半结构式信息槽和用户最新输入，完成本回合的识别、策略选择和自然回复。
+
+目标：
+1. 像真实助教/支持型同伴一样自然回应，不要机械复述模板。
+2. 不要连续重复同一个问题。如果用户回答“没有/还好/不知道/没什么”，要理解为有效回答，然后自然进入下一个需要了解的点或给出支持。
+3. 如果信息不足，只问一个最重要的后续问题；问题要贴合用户刚刚说的话。
+4. 如果用户负面情绪明显，先承接感受，再给一个很小、可执行的下一步。
+5. 不做医学诊断，不承诺治疗效果。高风险或持续强负面时，温和建议联系可信任的人、老师、辅导员或专业支持。
+
+反馈风格：{style_label}
+
+允许的 strategy:
+- continue_semi_structured_dialogue
+- positive_reinforcement
+- normal_reflection
+- light_support
+- standard_intervention
+- escalated_intervention
+
+只返回合法 JSON，不要 Markdown，不要解释。
+JSON schema:
+{{
+  "state": {{
+    "emotion": "joy|sadness|anxiety|anger|frustration|neutral|surprise",
+    "confidence": 0.0,
+    "intensity": 0,
+    "valence": "positive|neutral|negative",
+    "social_state": "supportive|isolated|conflictual|unstable|unknown",
+    "missing_info": []
+  }},
+  "strategy": "continue_semi_structured_dialogue",
+  "is_intervention": false,
+  "reply": "自然中文回复，2-4句"
+}}
+
+半结构式信息槽:
+{json.dumps(slot_context, ensure_ascii=False)}
+
+最近对话:
+{json.dumps(history, ensure_ascii=False)}
+
+用户最新输入:
+{text}
+"""
+    raw = deepseek_chat(
+        [
+            {"role": "system", "content": "你是自然、克制、支持性的中文对话规划器，只返回严格 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+        max_tokens=700,
+        enabled=True,
+        api_key_override=api_key,
+    )
+    parsed = extract_json_object(raw) if raw else None
+    if not parsed or not isinstance(parsed, dict):
+        return None
+
+    fallback_state = rule_analyse_state(session_id, text)
+    state = validate_state(parsed.get("state") or {}, fallback_state)
+    strategy = str(parsed.get("strategy") or "")
+    allowed = {
+        "continue_semi_structured_dialogue",
+        "positive_reinforcement",
+        "normal_reflection",
+        "light_support",
+        "standard_intervention",
+        "escalated_intervention",
+    }
+    if strategy not in allowed:
+        strategy, _ = select_feedback_strategy(recent_user_turns(session_id), state)
+    reply = str(parsed.get("reply") or "").strip()
+    if not reply:
+        reply = build_reply(state, strategy, style, use_api=False)
+    is_intervention = bool(parsed.get("is_intervention", strategy in {"standard_intervention", "escalated_intervention"}))
+    if strategy not in {"standard_intervention", "escalated_intervention"}:
+        is_intervention = False
+    return {
+        "state": state,
+        "strategy": strategy,
+        "is_intervention": is_intervention,
+        "reply": reply,
     }
 
 
@@ -587,7 +747,7 @@ def next_question(missing_info: list[str]) -> str:
     return "你愿意再具体说说最近发生了什么吗？"
 
 
-def build_reply(state: dict, strategy: str, style: str, use_api: bool = True) -> str:
+def build_reply(state: dict, strategy: str, style: str, use_api: bool = True, api_key: str | None = None) -> str:
     style_names = {
         "empathetic": "共情型",
         "rational": "理性型",
@@ -618,6 +778,7 @@ def build_reply(state: dict, strategy: str, style: str, use_api: bool = True) ->
         temperature=0.5,
         max_tokens=260,
         enabled=use_api,
+        api_key_override=api_key,
     )
     if generated:
         return generated.strip()
@@ -712,6 +873,7 @@ def handle_user_message(payload: dict) -> dict:
     username = payload.get("username", "demo_user")
     style = payload.get("style", "empathetic")
     use_api = bool(payload.get("use_api", True))
+    api_key = (payload.get("api_key") or "").strip() or None
     content = (payload.get("message") or "").strip()
     if not content:
         raise ValueError("Message cannot be empty.")
@@ -741,11 +903,20 @@ def handle_user_message(payload: dict) -> dict:
             "summary": summary,
             "api_mode": "local_fallback",
         }
-    state = analyse_state(session_id, content, use_api=use_api)
-    turns = recent_user_turns(session_id)
-    strategy, is_intervention = select_feedback_strategy(turns, state)
+    planned = deepseek_plan_turn(session_id, content, style, api_key=api_key) if use_api else None
+    if planned:
+        state = planned["state"]
+        strategy = planned["strategy"]
+        is_intervention = planned["is_intervention"]
+        reply = planned["reply"]
+        api_mode = "deepseek_planner"
+    else:
+        state = analyse_state(session_id, content, use_api=False)
+        turns = recent_user_turns(session_id)
+        strategy, is_intervention = select_feedback_strategy(turns, state)
+        reply = build_reply(state, strategy, style, use_api=False)
+        api_mode = "local_fallback"
     save_message(session_id, "user", content, state, strategy, is_intervention)
-    reply = build_reply(state, strategy, style, use_api=use_api)
     save_message(session_id, "assistant", reply, state, strategy, is_intervention)
     summary = aggregate_session(session_id)
     return {
@@ -755,7 +926,7 @@ def handle_user_message(payload: dict) -> dict:
         "is_intervention": is_intervention,
         "reply": reply,
         "summary": summary,
-        "api_mode": "deepseek_or_fallback" if use_api else "local_fallback",
+        "api_mode": api_mode,
     }
 
 
@@ -1019,6 +1190,7 @@ INDEX_HTML = r"""
     <div class="controls">
       <input id="username" value="demo_user" aria-label="username" />
       <input id="password" type="password" value="demo123" aria-label="password" />
+      <input id="apiKey" type="password" placeholder="DeepSeek API Key" aria-label="DeepSeek API Key" />
       <select id="style" aria-label="style">
         <option value="empathetic">共情型</option>
         <option value="rational">理性型</option>
@@ -1077,6 +1249,7 @@ INDEX_HTML = r"""
       return {
         username: document.getElementById("username").value || "demo_user",
         password: document.getElementById("password").value || "",
+        api_key: document.getElementById("apiKey").value || "",
         style: document.getElementById("style").value,
         use_api: document.getElementById("useApi").checked
       };
@@ -1161,7 +1334,7 @@ INDEX_HTML = r"""
         const result = await api("/api/message", {message: text});
         latestState = result.state;
         addMessage("assistant", result.reply, result.strategy, result.is_intervention);
-        setAuthStatus(result.api_mode === "local_fallback" ? "已登录 · 本地规则模式" : "已登录 · API 模式");
+        setAuthStatus(result.api_mode === "local_fallback" ? "已登录 · 本地规则模式" : "已登录 · DeepSeek 深度规划");
         await loadDashboard();
       } catch (error) {
         setAuthStatus(error.message);
