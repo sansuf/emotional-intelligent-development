@@ -897,7 +897,7 @@ def handle_user_message(payload: dict) -> dict:
 
     user_id = require_authenticated_user(payload)
     session_id = get_active_session(user_id)
-    if is_greeting_only(content):
+    if is_greeting_only(content) and not use_api:
         state = {
             "emotion": "neutral",
             "confidence": 0.8,
@@ -919,6 +919,7 @@ def handle_user_message(payload: dict) -> dict:
             "reply": reply,
             "summary": summary,
             "api_mode": "local_fallback",
+            "api_error": "Greeting handled locally because DeepSeek API is disabled.",
         }
     planned = deepseek_plan_turn(session_id, content, style, api_key=api_key) if use_api else None
     if planned:
