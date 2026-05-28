@@ -343,6 +343,14 @@ def deepseek_chat(
     if not api_key:
         LAST_DEEPSEEK_ERROR = "No DeepSeek API key found. Fill the page API key box or set DEEPSEEK_API_KEY before starting the server."
         return None
+    if not api_key.startswith("sk-"):
+        LAST_DEEPSEEK_ERROR = "Invalid DeepSeek API key format. The key should start with sk-. Do not paste placeholder text or Chinese descriptions."
+        return None
+    try:
+        api_key.encode("ascii")
+    except UnicodeEncodeError:
+        LAST_DEEPSEEK_ERROR = "Invalid DeepSeek API key. It contains non-English characters. Paste only the raw key, for example sk-xxxxxxxx."
+        return None
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
