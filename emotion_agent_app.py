@@ -184,10 +184,43 @@ def means_no_major_issue(text: str) -> bool:
     )
 
 
+def means_no_available_support(text: str) -> bool:
+    lowered = text.strip().lower()
+    exact_no = {"没有", "没有。", "没有！", "no", "no.", "no!"}
+    if lowered in exact_no:
+        return True
+    return contains_any(
+        text,
+        [
+            "no one",
+            "nobody",
+            "do not know who",
+            "don't know who",
+            "no such person",
+            "no support",
+            "alone",
+            "没有这样的人",
+            "没有这种人",
+            "没人",
+            "没有人",
+            "不知道问谁",
+            "不知道可以问谁",
+            "没有可以问的人",
+            "没有可以讨论的人",
+            "没人可以讨论",
+            "没人能帮",
+            "只能自己",
+            "一个人",
+        ],
+    )
+
+
 def detect_emotion(text: str) -> tuple[str, float, int, str]:
     lowered = text.lower()
     if is_greeting_only(text):
         return "neutral", 0.8, 1, "neutral"
+    if means_no_available_support(text):
+        return "sadness", 0.76, 5, "negative"
     if means_no_major_issue(text):
         return "neutral", 0.78, 2, "neutral"
     rules = [
@@ -265,6 +298,9 @@ def update_dialogue_slots(session_id: str, text: str) -> dict:
         if means_no_major_issue(text):
             slots["recent_status"] = text[:240]
             slots["pressure_source"] = "none reported"
+        if means_no_available_support(text):
+            slots["support_level"] = "weak"
+            slots["key_people"] = "none reported"
         if contains_any(lowered, ["project", "homework", "presentation", "exam", "work", "任务", "项目", "作业", "考试", "汇报", "学习"]):
             slots["recent_status"] = text[:240]
         if contains_any(lowered, ["pressure", "deadline", "worry", "stuck", "bug", "stress", "压力", "截止", "焦虑", "卡住", "困难"]):
@@ -274,7 +310,7 @@ def update_dialogue_slots(session_id: str, text: str) -> dict:
         if contains_any(lowered, ["teammate", "friend", "teacher", "family", "classmate", "队友", "朋友", "老师", "家人", "同学"]):
             slots["key_people"] = text[:240]
         if contains_any(lowered, ["help", "support", "ask", "said it was helpful", "帮助", "支持", "可以问", "有帮助"]):
-            slots["support_level"] = "available" if not contains_any(lowered, ["do not know who", "no one", "没人", "不知道问谁"]) else "weak"
+            slots["support_level"] = "weak" if means_no_available_support(text) else "available"
         if contains_any(lowered, ["conflict", "argue", "unfair", "ignored", "冲突", "吵", "不公平", "忽视"]):
             slots["conflict_signal"] = text[:240]
 
@@ -316,7 +352,7 @@ def infer_social_state(slots: dict, text: str) -> str:
     support_level = slots.get("support_level")
     if slots.get("conflict_signal"):
         return "conflictual"
-    if contains_any(lowered, ["do not know who", "no one", "alone", "isolated", "没人", "不知道问谁", "孤立", "一个人"]):
+    if means_no_available_support(text):
         return "isolated"
     if support_level == "weak":
         return "isolated"
