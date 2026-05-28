@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
+import hmac
+import secrets
 import sqlite3
 import uuid
 from collections import Counter
@@ -43,6 +46,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
+                password_hash TEXT,
                 intervention_style TEXT NOT NULL DEFAULT 'empathetic',
                 created_at TEXT NOT NULL
             );
@@ -89,6 +93,82 @@ def init_db() -> None:
             );
             """
         )
+        user_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "password_hash" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return f"pbkdf2_sha256${salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str | None) -> bool:
+    if not stored_hash:
+        return False
+    try:
+        algorithm, salt, expected = stored_hash.split("$", 2)
+    except ValueError:
+        return False
+    if algorithm != "pbkdf2_sha256":
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return hmac.compare_digest(digest.hex(), expected)
+
+
+def register_user(username: str, password: str, style: str) -> dict:
+    username = (username or "").strip()[:40]
+    style = style if style in {"empathetic", "rational", "light", "positive"} else "empathetic"
+    if len(username) < 3:
+        raise ValueError("Username must contain at least 3 characters.")
+    if len(password or "") < 6:
+        raise ValueError("Password must contain at least 6 characters.")
+    with db_connect() as conn:
+        existing = conn.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,)).fetchone()
+        if existing:
+            if existing["password_hash"]:
+                raise ValueError("Username already exists.")
+            conn.execute(
+                "UPDATE users SET password_hash = ?, intervention_style = ? WHERE id = ?",
+                (hash_password(password), style, existing["id"]),
+            )
+            get_active_session(existing["id"])
+            return {"user_id": existing["id"], "username": username, "style": style}
+        user_id = f"user_{uuid.uuid4().hex[:10]}"
+        conn.execute(
+            """
+            INSERT INTO users (id, username, password_hash, intervention_style, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, username, hash_password(password), style, now_iso()),
+        )
+    get_active_session(user_id)
+    return {"user_id": user_id, "username": username, "style": style}
+
+
+def login_user(username: str, password: str, style: str) -> dict:
+    username = (username or "").strip()[:40]
+    style = style if style in {"empathetic", "rational", "light", "positive"} else "empathetic"
+    with db_connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if not row or not verify_password(password or "", row["password_hash"]):
+            raise ValueError("Invalid username or password.")
+        conn.execute("UPDATE users SET intervention_style = ? WHERE id = ?", (style, row["id"]))
+    get_active_session(row["id"])
+    return {"user_id": row["id"], "username": username, "style": style}
+
+
+def require_authenticated_user(payload: dict) -> str:
+    username = (payload.get("username") or "").strip()[:40]
+    password = payload.get("password") or ""
+    if not username or not password:
+        raise ValueError("Please login first.")
+    with db_connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if not row or not verify_password(password, row["password_hash"]):
+            raise ValueError("Invalid username or password.")
+        return row["id"]
 
 
 def get_or_create_user(username: str, style: str) -> str:
@@ -101,8 +181,8 @@ def get_or_create_user(username: str, style: str) -> str:
             return row["id"]
         user_id = f"user_{uuid.uuid4().hex[:10]}"
         conn.execute(
-            "INSERT INTO users (id, username, intervention_style, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, username, style, now_iso()),
+            "INSERT INTO users (id, username, password_hash, intervention_style, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, None, style, now_iso()),
         )
         return user_id
 
@@ -127,8 +207,11 @@ def get_active_session(user_id: str) -> str:
         return session_id
 
 
-def reset_session(username: str, style: str) -> str:
-    user_id = get_or_create_user(username, style)
+def reset_session(username: str, style: str, password: str | None = None) -> str:
+    if password:
+        user_id = require_authenticated_user({"username": username, "password": password})
+    else:
+        user_id = get_or_create_user(username, style)
     with db_connect() as conn:
         conn.execute(
             "UPDATE sessions SET ended_at = ? WHERE user_id = ? AND ended_at IS NULL",
@@ -628,7 +711,7 @@ def handle_user_message(payload: dict) -> dict:
     if not content:
         raise ValueError("Message cannot be empty.")
 
-    user_id = get_or_create_user(username, style)
+    user_id = require_authenticated_user(payload)
     session_id = get_active_session(user_id)
     if is_greeting_only(content):
         state = {
@@ -669,21 +752,61 @@ def handle_user_message(payload: dict) -> dict:
     }
 
 
-def dashboard(username: str, style: str) -> dict:
-    user_id = get_or_create_user(username, style)
+def dashboard(username: str, style: str, password: str | None = None) -> dict:
+    if password:
+        user_id = require_authenticated_user({"username": username, "password": password})
+    else:
+        user_id = get_or_create_user(username, style)
     session_id = get_active_session(user_id)
     with db_connect() as conn:
         rows = conn.execute(
             "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,),
         ).fetchall()
+        history_rows = conn.execute(
+            """
+            SELECT m.*, s.started_at AS session_started_at
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE s.user_id = ? AND m.role = 'user'
+            ORDER BY m.created_at ASC
+            """,
+            (user_id,),
+        ).fetchall()
+        session_rows = conn.execute(
+            """
+            SELECT id, started_at, ended_at, dominant_emotion, dominant_social_state, mean_intensity, summary
+            FROM sessions
+            WHERE user_id = ?
+            ORDER BY started_at DESC
+            LIMIT 8
+            """,
+            (user_id,),
+        ).fetchall()
         slots = conn.execute(
             "SELECT * FROM dialogue_slots WHERE session_id = ?",
             (session_id,),
         ).fetchone()
+    history = [dict(row) for row in history_rows]
+    emotion_counts = Counter(row["emotion"] or "unknown" for row in history)
+    social_counts = Counter(row["social_state"] or "unknown" for row in history)
+    trend = [
+        {
+            "created_at": row["created_at"],
+            "emotion": row["emotion"],
+            "intensity": row["intensity"] or 0,
+            "social_state": row["social_state"],
+            "strategy": row["strategy"],
+        }
+        for row in history
+    ]
     return {
         "session_id": session_id,
         "messages": [dict(row) for row in rows],
+        "history": trend[-50:],
+        "emotion_counts": dict(emotion_counts),
+        "social_counts": dict(social_counts),
+        "sessions": [dict(row) for row in session_rows],
         "slots": dict(slots) if slots else {},
         "summary": aggregate_session(session_id),
     }
@@ -763,6 +886,11 @@ INDEX_HTML = r"""
       cursor: pointer;
     }
     button.secondary { background: white; color: var(--green); }
+    .auth-status {
+      min-width: 120px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     .chat {
       display: flex;
       flex-direction: column;
@@ -830,6 +958,34 @@ INDEX_HTML = r"""
       margin: 12px 0;
       padding: 10px;
     }
+    .bars { display: grid; gap: 8px; margin: 12px 0; }
+    .bar-row {
+      display: grid;
+      grid-template-columns: 92px 1fr 32px;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .bar-track {
+      height: 10px;
+      border-radius: 999px;
+      background: #eef0ea;
+      overflow: hidden;
+    }
+    .bar-fill { height: 100%; background: var(--green); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 6px 4px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; }
     @media (max-width: 860px) {
       main { grid-template-columns: 1fr; padding: 10px; }
       .chat { min-height: 70vh; }
@@ -845,13 +1001,18 @@ INDEX_HTML = r"""
     </div>
     <div class="controls">
       <input id="username" value="demo_user" aria-label="username" />
+      <input id="password" type="password" value="demo123" aria-label="password" />
       <select id="style" aria-label="style">
         <option value="empathetic">共情型</option>
         <option value="rational">理性型</option>
         <option value="light">轻松型</option>
         <option value="positive">积极型</option>
       </select>
+      <button onclick="register()">注册</button>
+      <button onclick="login()">登录</button>
+      <button class="secondary" onclick="logout()">退出</button>
       <button class="secondary" onclick="resetSession()">新会话</button>
+      <span id="authStatus" class="auth-status">未登录</span>
     </div>
   </header>
   <main>
@@ -871,6 +1032,15 @@ INDEX_HTML = r"""
         <div class="metric"><b>干预次数</b><span id="interventions">0</span></div>
       </div>
       <div class="chart"><svg id="chart" width="100%" height="150"></svg></div>
+      <h3>情绪历史统计</h3>
+      <div id="emotionBars" class="bars"></div>
+      <h3>社交状态统计</h3>
+      <div id="socialBars" class="bars"></div>
+      <h3>历史记录</h3>
+      <table>
+        <thead><tr><th>时间</th><th>情绪</th><th>强度</th><th>社交状态</th><th>策略</th></tr></thead>
+        <tbody id="historyRows"></tbody>
+      </table>
       <h3>最新识别结果</h3>
       <pre id="latestState" class="json">{}</pre>
       <h3>半结构式信息槽</h3>
@@ -883,10 +1053,12 @@ INDEX_HTML = r"""
     const chatLog = document.getElementById("chatLog");
     const messageBox = document.getElementById("message");
     let latestState = {};
+    let loggedIn = false;
 
     function settings() {
       return {
         username: document.getElementById("username").value || "demo_user",
+        password: document.getElementById("password").value || "",
         style: document.getElementById("style").value
       };
     }
@@ -897,8 +1069,54 @@ INDEX_HTML = r"""
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({...settings(), ...body})
       });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        const text = await res.text();
+        try {
+          const payload = JSON.parse(text);
+          throw new Error(payload.error || text);
+        } catch {
+          throw new Error(text);
+        }
+      }
       return await res.json();
+    }
+
+    function setAuthStatus(text) {
+      document.getElementById("authStatus").textContent = text;
+    }
+
+    async function register() {
+      try {
+        await api("/api/register", {});
+        loggedIn = true;
+        setAuthStatus("已注册并登录");
+        chatLog.innerHTML = "";
+        addMessage("assistant", "注册成功。我会先通过几个问题了解你的近况和社交支持情况。最近你主要在忙什么？", "start", false);
+        await loadDashboard();
+      } catch (error) {
+        setAuthStatus(error.message);
+      }
+    }
+
+    async function login() {
+      try {
+        await api("/api/login", {});
+        loggedIn = true;
+        setAuthStatus("已登录");
+        chatLog.innerHTML = "";
+        await loadDashboard();
+        addMessage("assistant", "欢迎回来。你可以继续描述最近的状态，右侧会显示你的情绪历史和统计。", "login", false);
+      } catch (error) {
+        setAuthStatus(error.message);
+      }
+    }
+
+    function logout() {
+      loggedIn = false;
+      latestState = {};
+      chatLog.innerHTML = "";
+      setAuthStatus("未登录");
+      document.getElementById("latestState").textContent = "{}";
     }
 
     function addMessage(role, content, strategy, isIntervention) {
@@ -912,17 +1130,29 @@ INDEX_HTML = r"""
     }
 
     async function sendMessage() {
+      if (!loggedIn) {
+        setAuthStatus("请先注册或登录");
+        return;
+      }
       const text = messageBox.value.trim();
       if (!text) return;
       messageBox.value = "";
       addMessage("user", text, "", false);
-      const result = await api("/api/message", {message: text});
-      latestState = result.state;
-      addMessage("assistant", result.reply, result.strategy, result.is_intervention);
-      await loadDashboard();
+      try {
+        const result = await api("/api/message", {message: text});
+        latestState = result.state;
+        addMessage("assistant", result.reply, result.strategy, result.is_intervention);
+        await loadDashboard();
+      } catch (error) {
+        setAuthStatus(error.message);
+      }
     }
 
     async function resetSession() {
+      if (!loggedIn) {
+        setAuthStatus("请先注册或登录");
+        return;
+      }
       chatLog.innerHTML = "";
       latestState = {};
       await api("/api/reset", {});
@@ -939,7 +1169,40 @@ INDEX_HTML = r"""
       document.getElementById("summary").textContent = result.summary.summary;
       document.getElementById("latestState").textContent = JSON.stringify(latestState, null, 2);
       document.getElementById("slots").textContent = JSON.stringify(result.slots, null, 2);
-      drawChart(result.messages.filter(m => m.role === "user"));
+      drawChart(result.history || result.messages.filter(m => m.role === "user"));
+      renderBars("emotionBars", result.emotion_counts || {});
+      renderBars("socialBars", result.social_counts || {});
+      renderHistory(result.history || []);
+    }
+
+    function renderBars(targetId, counts) {
+      const node = document.getElementById(targetId);
+      node.innerHTML = "";
+      const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      const total = entries.reduce((sum, item) => sum + item[1], 0) || 1;
+      if (!entries.length) {
+        node.innerHTML = `<div class="sub">暂无历史数据</div>`;
+        return;
+      }
+      entries.forEach(([label, count]) => {
+        const row = document.createElement("div");
+        row.className = "bar-row";
+        row.innerHTML = `<span>${label}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.round(count * 100 / total)}%"></div></div><span>${count}</span>`;
+        node.appendChild(row);
+      });
+    }
+
+    function renderHistory(history) {
+      const tbody = document.getElementById("historyRows");
+      tbody.innerHTML = "";
+      history.slice(-12).reverse().forEach(item => {
+        const row = document.createElement("tr");
+        row.innerHTML = `<td>${(item.created_at || "").replace("T", " ")}</td><td>${item.emotion || ""}</td><td>${item.intensity ?? ""}</td><td>${item.social_state || ""}</td><td>${item.strategy || ""}</td>`;
+        tbody.appendChild(row);
+      });
+      if (!history.length) {
+        tbody.innerHTML = `<tr><td colspan="5" class="sub">暂无历史记录</td></tr>`;
+      }
     }
 
     function drawChart(points) {
@@ -983,7 +1246,7 @@ INDEX_HTML = r"""
         sendMessage();
       }
     });
-    resetSession();
+    setAuthStatus("请注册或登录");
   </script>
 </body>
 </html>
@@ -1003,12 +1266,16 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             path = urlparse(self.path).path
-            if path == "/api/message":
+            if path == "/api/register":
+                self.respond_json(register_user(payload.get("username", ""), payload.get("password", ""), payload.get("style", "empathetic")))
+            elif path == "/api/login":
+                self.respond_json(login_user(payload.get("username", ""), payload.get("password", ""), payload.get("style", "empathetic")))
+            elif path == "/api/message":
                 self.respond_json(handle_user_message(payload))
             elif path == "/api/dashboard":
-                self.respond_json(dashboard(payload.get("username", "demo_user"), payload.get("style", "empathetic")))
+                self.respond_json(dashboard(payload.get("username", "demo_user"), payload.get("style", "empathetic"), payload.get("password")))
             elif path == "/api/reset":
-                session_id = reset_session(payload.get("username", "demo_user"), payload.get("style", "empathetic"))
+                session_id = reset_session(payload.get("username", "demo_user"), payload.get("style", "empathetic"), payload.get("password"))
                 self.respond_json({"session_id": session_id})
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)

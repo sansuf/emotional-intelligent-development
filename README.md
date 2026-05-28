@@ -4,6 +4,7 @@
 
 ## 功能
 
+- User Authentication：注册、登录、密码哈希存储、用户数据隔离
 - 半结构式一对一对话
 - 情绪状态识别
 - 社交关系状态识别
@@ -11,7 +12,7 @@
 - DeepSeek API 生成识别结果和回复
 - API 不可用时自动使用本地规则 fallback
 - SQLite 保存消息、识别结果、策略和会话摘要
-- 浏览器页面展示聊天与 dashboard
+- Emotion Dashboard：展示当前会话指标、历史情绪统计、社交状态统计、强度趋势和历史记录
 
 ## 启动方式
 
@@ -38,6 +39,24 @@ python emotion_agent_app.py
 ```text
 http://127.0.0.1:8501
 ```
+
+## 使用流程
+
+1. 在右上角输入用户名和密码。
+2. 第一次使用点击“注册”。
+3. 已经注册过点击“登录”。
+4. 登录后可以开始聊天。
+5. 点击“新会话”可以结束当前会话并开始新的演示。
+6. 右侧 Dashboard 会显示当前用户自己的情绪历史和分析结果。
+
+默认页面会填入：
+
+```text
+username: demo_user
+password: demo123
+```
+
+第一次使用这个默认账号时，点击“注册”即可。
 
 ## 演示输入
 
@@ -77,3 +96,4 @@ I tried to fix the same bug for two hours. I feel stuck, and I do not know who I
 
 如果没有设置 API key，或者网络/API 调用失败，系统会使用本地规则进行识别和回复，保证演示不中断。
 
+密码不会以明文保存到数据库，系统使用 PBKDF2 哈希存储密码。
