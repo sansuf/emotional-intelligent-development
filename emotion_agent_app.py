@@ -332,6 +332,7 @@ def deepseek_chat(
     max_tokens: int = 500,
     enabled: bool = True,
     api_key_override: str | None = None,
+    json_mode: bool = False,
 ) -> str | None:
     global LAST_DEEPSEEK_ERROR
     LAST_DEEPSEEK_ERROR = ""
@@ -342,15 +343,15 @@ def deepseek_chat(
     if not api_key:
         LAST_DEEPSEEK_ERROR = "No DeepSeek API key found. Fill the page API key box or set DEEPSEEK_API_KEY before starting the server."
         return None
-    body = json.dumps(
-        {
-            "model": DEEPSEEK_MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = Request(
         DEEPSEEK_URL,
         data=body,
@@ -538,6 +539,7 @@ JSON schema:
         max_tokens=300,
         enabled=use_api,
         api_key_override=api_key,
+        json_mode=True,
     )
     parsed = extract_json_object(raw) if raw else None
     if not parsed:
@@ -606,6 +608,7 @@ def validate_state(parsed_state: dict, fallback: dict) -> dict:
 
 
 def deepseek_plan_turn(session_id: str, text: str, style: str, api_key: str | None = None) -> dict | None:
+    global LAST_DEEPSEEK_ERROR
     slots = update_dialogue_slots(session_id, text)
     slot_context = {
         "recent_status": slots.get("recent_status"),
@@ -677,9 +680,12 @@ JSON schema:
         max_tokens=700,
         enabled=True,
         api_key_override=api_key,
+        json_mode=True,
     )
     parsed = extract_json_object(raw) if raw else None
     if not parsed or not isinstance(parsed, dict):
+        snippet = (raw or "").strip().replace("\n", " ")[:180]
+        LAST_DEEPSEEK_ERROR = f"DeepSeek returned non-JSON or invalid planner output. Raw: {snippet or 'empty response'}"
         return None
 
     fallback_state = rule_analyse_state(session_id, text)
@@ -694,6 +700,7 @@ JSON schema:
         "escalated_intervention",
     }
     if strategy not in allowed:
+        LAST_DEEPSEEK_ERROR = f"DeepSeek returned invalid strategy: {strategy}"
         strategy, _ = select_feedback_strategy(recent_user_turns(session_id), state)
     reply = str(parsed.get("reply") or "").strip()
     if not reply:
