@@ -1,0 +1,5 @@
+emotion_agent.db
+*.pyc
+__pycache__/
+.env
+*.log
