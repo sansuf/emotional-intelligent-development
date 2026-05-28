@@ -142,8 +142,54 @@ def contains_any(text: str, words: list[str]) -> bool:
     return any(word in lowered for word in words)
 
 
+def is_greeting_only(text: str) -> bool:
+    lowered = text.strip().lower()
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "你好",
+        "您好",
+        "嗨",
+        "哈喽",
+        "hello!",
+        "hi!",
+        "你好。",
+        "你好！",
+    }
+    return lowered in greetings
+
+
+def means_no_major_issue(text: str) -> bool:
+    return contains_any(
+        text,
+        [
+            "nothing",
+            "nothing much",
+            "not much",
+            "no problem",
+            "fine",
+            "okay",
+            "ok",
+            "没什么",
+            "没啥",
+            "还好",
+            "还行",
+            "正常",
+            "没有压力",
+            "没压力",
+            "没什么事情",
+            "没什么事",
+        ],
+    )
+
+
 def detect_emotion(text: str) -> tuple[str, float, int, str]:
     lowered = text.lower()
+    if is_greeting_only(text):
+        return "neutral", 0.8, 1, "neutral"
+    if means_no_major_issue(text):
+        return "neutral", 0.78, 2, "neutral"
     rules = [
         ("joy", ["happy", "excited", "proud", "great", "helpful", "finished", "完成", "开心", "高兴", "兴奋", "顺利", "有帮助"], 0.92, 8, "positive"),
         ("anxiety", ["worry", "worried", "anxious", "nervous", "presentation", "can't sleep", "cannot sleep", "焦虑", "担心", "紧张", "睡不着", "汇报"], 0.90, 7, "negative"),
@@ -216,6 +262,9 @@ def update_dialogue_slots(session_id: str, text: str) -> dict:
         row = conn.execute("SELECT * FROM dialogue_slots WHERE session_id = ?", (session_id,)).fetchone()
         slots = dict(row) if row else {"session_id": session_id}
 
+        if means_no_major_issue(text):
+            slots["recent_status"] = text[:240]
+            slots["pressure_source"] = "none reported"
         if contains_any(lowered, ["project", "homework", "presentation", "exam", "work", "任务", "项目", "作业", "考试", "汇报", "学习"]):
             slots["recent_status"] = text[:240]
         if contains_any(lowered, ["pressure", "deadline", "worry", "stuck", "bug", "stress", "压力", "截止", "焦虑", "卡住", "困难"]):
@@ -451,7 +500,7 @@ def build_reply(state: dict, strategy: str, style: str) -> str:
         return generated.strip()
 
     if strategy == "continue_semi_structured_dialogue":
-        return f"我先多了解一点背景，这样不会只凭一句话判断你。{next_question(state['missing_info'])}"
+        return f"好的，我先继续了解一点背景。{next_question(state['missing_info'])}"
     if strategy == "positive_reinforcement":
         return "听起来你最近有一个不错的进展，而且身边也有正向反馈。可以把这次做得好的地方记下来，后面遇到压力时它会成为一个很有用的参考。"
     if strategy == "normal_reflection":
@@ -545,6 +594,28 @@ def handle_user_message(payload: dict) -> dict:
 
     user_id = get_or_create_user(username, style)
     session_id = get_active_session(user_id)
+    if is_greeting_only(content):
+        state = {
+            "emotion": "neutral",
+            "confidence": 0.8,
+            "intensity": 1,
+            "valence": "neutral",
+            "social_state": "unknown",
+            "missing_info": ["recent status", "pressure source", "recent sleep or energy", "available support"],
+        }
+        strategy = "continue_semi_structured_dialogue"
+        reply = "你好，我会先通过几个问题了解你的近况和社交支持情况。最近你主要在忙什么？有没有让你感觉有压力的事情？"
+        save_message(session_id, "user", content, state, strategy, False)
+        save_message(session_id, "assistant", reply, state, strategy, False)
+        summary = aggregate_session(session_id)
+        return {
+            "session_id": session_id,
+            "state": state,
+            "strategy": strategy,
+            "is_intervention": False,
+            "reply": reply,
+            "summary": summary,
+        }
     state = analyse_state(session_id, content)
     turns = recent_user_turns(session_id)
     strategy, is_intervention = select_feedback_strategy(turns, state)
