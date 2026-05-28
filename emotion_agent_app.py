@@ -322,7 +322,9 @@ def detect_emotion(text: str) -> tuple[str, float, int, str]:
     return "neutral", 0.72, 3, "neutral"
 
 
-def deepseek_chat(messages: list[dict], temperature: float = 0.2, max_tokens: int = 500) -> str | None:
+def deepseek_chat(messages: list[dict], temperature: float = 0.2, max_tokens: int = 500, enabled: bool = True) -> str | None:
+    if not enabled:
+        return None
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         return None
@@ -459,7 +461,7 @@ def rule_analyse_state(session_id: str, text: str) -> dict:
     }
 
 
-def analyse_state(session_id: str, text: str) -> dict:
+def analyse_state(session_id: str, text: str, use_api: bool = True) -> dict:
     slots = update_dialogue_slots(session_id, text)
     dialogue_context = {
         "recent_status": slots.get("recent_status"),
@@ -504,6 +506,7 @@ JSON schema:
         ],
         temperature=0.1,
         max_tokens=300,
+        enabled=use_api,
     )
     parsed = extract_json_object(raw) if raw else None
     if not parsed:
@@ -584,7 +587,7 @@ def next_question(missing_info: list[str]) -> str:
     return "你愿意再具体说说最近发生了什么吗？"
 
 
-def build_reply(state: dict, strategy: str, style: str) -> str:
+def build_reply(state: dict, strategy: str, style: str, use_api: bool = True) -> str:
     style_names = {
         "empathetic": "共情型",
         "rational": "理性型",
@@ -614,6 +617,7 @@ def build_reply(state: dict, strategy: str, style: str) -> str:
         ],
         temperature=0.5,
         max_tokens=260,
+        enabled=use_api,
     )
     if generated:
         return generated.strip()
@@ -707,6 +711,7 @@ def aggregate_session(session_id: str) -> dict:
 def handle_user_message(payload: dict) -> dict:
     username = payload.get("username", "demo_user")
     style = payload.get("style", "empathetic")
+    use_api = bool(payload.get("use_api", True))
     content = (payload.get("message") or "").strip()
     if not content:
         raise ValueError("Message cannot be empty.")
@@ -734,12 +739,13 @@ def handle_user_message(payload: dict) -> dict:
             "is_intervention": False,
             "reply": reply,
             "summary": summary,
+            "api_mode": "local_fallback",
         }
-    state = analyse_state(session_id, content)
+    state = analyse_state(session_id, content, use_api=use_api)
     turns = recent_user_turns(session_id)
     strategy, is_intervention = select_feedback_strategy(turns, state)
     save_message(session_id, "user", content, state, strategy, is_intervention)
-    reply = build_reply(state, strategy, style)
+    reply = build_reply(state, strategy, style, use_api=use_api)
     save_message(session_id, "assistant", reply, state, strategy, is_intervention)
     summary = aggregate_session(session_id)
     return {
@@ -749,6 +755,7 @@ def handle_user_message(payload: dict) -> dict:
         "is_intervention": is_intervention,
         "reply": reply,
         "summary": summary,
+        "api_mode": "deepseek_or_fallback" if use_api else "local_fallback",
     }
 
 
@@ -891,6 +898,16 @@ INDEX_HTML = r"""
       color: var(--muted);
       font-size: 12px;
     }
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      height: 34px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .toggle input { height: auto; }
     .chat {
       display: flex;
       flex-direction: column;
@@ -1008,6 +1025,7 @@ INDEX_HTML = r"""
         <option value="light">轻松型</option>
         <option value="positive">积极型</option>
       </select>
+      <label class="toggle"><input id="useApi" type="checkbox" checked /> 使用 DeepSeek API</label>
       <button onclick="register()">注册</button>
       <button onclick="login()">登录</button>
       <button class="secondary" onclick="logout()">退出</button>
@@ -1059,7 +1077,8 @@ INDEX_HTML = r"""
       return {
         username: document.getElementById("username").value || "demo_user",
         password: document.getElementById("password").value || "",
-        style: document.getElementById("style").value
+        style: document.getElementById("style").value,
+        use_api: document.getElementById("useApi").checked
       };
     }
 
@@ -1142,6 +1161,7 @@ INDEX_HTML = r"""
         const result = await api("/api/message", {message: text});
         latestState = result.state;
         addMessage("assistant", result.reply, result.strategy, result.is_intervention);
+        setAuthStatus(result.api_mode === "local_fallback" ? "已登录 · 本地规则模式" : "已登录 · API 模式");
         await loadDashboard();
       } catch (error) {
         setAuthStatus(error.message);
