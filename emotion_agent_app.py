@@ -682,9 +682,13 @@ JSON schema:
         api_key_override=api_key,
         json_mode=True,
     )
-    parsed = extract_json_object(raw) if raw else None
+    if raw is None:
+        if not LAST_DEEPSEEK_ERROR:
+            LAST_DEEPSEEK_ERROR = "DeepSeek returned empty response."
+        return None
+    parsed = extract_json_object(raw)
     if not parsed or not isinstance(parsed, dict):
-        snippet = (raw or "").strip().replace("\n", " ")[:180]
+        snippet = raw.strip().replace("\n", " ")[:180]
         LAST_DEEPSEEK_ERROR = f"DeepSeek returned non-JSON or invalid planner output. Raw: {snippet or 'empty response'}"
         return None
 
@@ -1352,6 +1356,9 @@ INDEX_HTML = r"""
         addMessage("assistant", result.reply, result.strategy, result.is_intervention);
         if (result.api_mode === "local_fallback") {
           setAuthStatus("已登录 · 本地规则模式 · " + (result.api_error || "API 未返回有效结果"));
+          if (document.getElementById("useApi").checked) {
+            addMessage("assistant", "API 调用没有成功，原因：" + (result.api_error || "API 未返回有效结果"), "api_debug", false);
+          }
         } else {
           setAuthStatus("已登录 · DeepSeek 深度规划");
         }
