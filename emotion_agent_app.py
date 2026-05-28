@@ -23,6 +23,7 @@ HOST = "127.0.0.1"
 PORT = 8501
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
+LAST_DEEPSEEK_ERROR = ""
 
 NEGATIVE_EMOTIONS = {"sadness", "anxiety", "anger", "frustration"}
 TRIGGER_INTENSITY = 6
@@ -332,10 +333,14 @@ def deepseek_chat(
     enabled: bool = True,
     api_key_override: str | None = None,
 ) -> str | None:
+    global LAST_DEEPSEEK_ERROR
+    LAST_DEEPSEEK_ERROR = ""
     if not enabled:
+        LAST_DEEPSEEK_ERROR = "DeepSeek API disabled by frontend toggle."
         return None
     api_key = (api_key_override or os.getenv("DEEPSEEK_API_KEY", "")).strip()
     if not api_key:
+        LAST_DEEPSEEK_ERROR = "No DeepSeek API key found. Fill the page API key box or set DEEPSEEK_API_KEY before starting the server."
         return None
     body = json.dumps(
         {
@@ -360,6 +365,7 @@ def deepseek_chat(
             payload = json.loads(res.read().decode("utf-8"))
             return payload["choices"][0]["message"]["content"]
     except Exception as exc:
+        LAST_DEEPSEEK_ERROR = str(exc)
         print(f"DeepSeek call failed; using rule fallback. Reason: {exc}")
         return None
 
@@ -910,7 +916,9 @@ def handle_user_message(payload: dict) -> dict:
         is_intervention = planned["is_intervention"]
         reply = planned["reply"]
         api_mode = "deepseek_planner"
+        api_error = ""
     else:
+        api_error = LAST_DEEPSEEK_ERROR if use_api else "DeepSeek API disabled by frontend toggle."
         state = analyse_state(session_id, content, use_api=False)
         turns = recent_user_turns(session_id)
         strategy, is_intervention = select_feedback_strategy(turns, state)
@@ -927,6 +935,7 @@ def handle_user_message(payload: dict) -> dict:
         "reply": reply,
         "summary": summary,
         "api_mode": api_mode,
+        "api_error": api_error,
     }
 
 
@@ -1334,7 +1343,11 @@ INDEX_HTML = r"""
         const result = await api("/api/message", {message: text});
         latestState = result.state;
         addMessage("assistant", result.reply, result.strategy, result.is_intervention);
-        setAuthStatus(result.api_mode === "local_fallback" ? "已登录 · 本地规则模式" : "已登录 · DeepSeek 深度规划");
+        if (result.api_mode === "local_fallback") {
+          setAuthStatus("已登录 · 本地规则模式 · " + (result.api_error || "API 未返回有效结果"));
+        } else {
+          setAuthStatus("已登录 · DeepSeek 深度规划");
+        }
         await loadDashboard();
       } catch (error) {
         setAuthStatus(error.message);
